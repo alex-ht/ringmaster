@@ -17,6 +17,20 @@ class ShardInfo:
     pad_len: int
 
 
+# Key under which a batch sharded ahead of the forward (in the collator) carries its
+# shard description; the CP pre-hook pops it and skips re-sharding.
+CP_SHARD_KEY = "_cp_shard"
+
+_GLOBAL_METADATA_KEYS = (
+    "cu_seq_lens_q",
+    "cu_seq_lens_k",
+    "max_length_q",
+    "max_length_k",
+    "cu_seqlens",
+    "max_seqlen",
+)
+
+
 def _pad_multiple(seq_len: int, cp_size: int) -> int:
     rem = seq_len % cp_size
     return 0 if rem == 0 else cp_size - rem
@@ -203,3 +217,108 @@ def shard_batch(
             batch[key] = val.chunk(cp_size, dim=1)[cp_rank].contiguous()
 
     return batch, ShardInfo(original_seq_len=seq_len, pad_len=pad_len)
+
+
+def prepare_global_batch(batch: dict) -> dict:
+    """Normalize a full (unsharded) batch before sharding.
+
+    Validates a 2D right-padded causal ``attention_mask`` and derives packed
+    ``position_ids`` from a segment-numbered mask or from global ``cu_seqlens`` /
+    ``cu_seq_lens_q`` when they are missing, then drops the mask and the global
+    collator metadata, which cannot describe a local shard. Device-agnostic, so it
+    runs in a dataloader worker as well as in the forward pre-hook.
+    """
+    ids = batch["input_ids"]
+    mask = batch.get("attention_mask")
+    if mask is not None:
+        if (
+            mask.ndim != 2
+            or torch.any(mask < 0)
+            or (
+                mask.is_floating_point()
+                and torch.any(~torch.isfinite(mask) | (mask != mask.round()))
+            )
+            or torch.any((mask[:, 1:] > 0) & (mask[:, :-1] == 0))
+        ):
+            raise ValueError(
+                "Context parallelism requires a right-padded causal 2D mask"
+            )
+        if torch.any(mask > 1) and batch.get("position_ids") is None:
+            positions = torch.arange(mask.shape[1], device=mask.device).expand_as(mask)
+            starts = torch.ones_like(mask, dtype=torch.bool)
+            starts[:, 1:] = mask[:, 1:] != mask[:, :-1]
+            offsets = torch.where(starts, positions, 0).cummax(dim=1).values
+            batch["position_ids"] = positions - offsets
+        batch.pop("attention_mask")
+    if batch.get("position_ids") is None:
+        cu = batch.get("cu_seqlens")
+        if cu is None:
+            cu = batch.get("cu_seq_lens_q")
+        if cu is not None:
+            cu = cu.to(device=ids.device, dtype=torch.long)
+            if (
+                cu.ndim != 1
+                or cu.numel() < 2
+                or int(cu[0]) != 0
+                or int(cu[-1]) != ids.numel()
+                or torch.any(cu[1:] <= cu[:-1])
+            ):
+                raise ValueError("Invalid global packed document boundaries")
+            positions = torch.arange(ids.numel(), device=ids.device)
+            documents = torch.bucketize(positions, cu[1:], right=True)
+            batch["position_ids"] = (positions - cu[documents]).reshape_as(ids)
+    for key in _GLOBAL_METADATA_KEYS:
+        batch.pop(key, None)
+    return batch
+
+
+def shard_collated_batch(
+    batch: dict,
+    *,
+    cp_rank: int,
+    cp_size: int,
+    load_balance: str = "contiguous",
+) -> dict:
+    """Shard a collated batch for ``cp_rank`` ahead of the forward.
+
+    Meant for the collator: the CP ranks of a data-parallel group receive the same
+    global batch, so each can cut its own shard in the dataloader worker instead of
+    the forward pre-hook doing it on device every step. The result carries a
+    :data:`CP_SHARD_KEY` entry (plain Python values only, so it survives pickling and
+    device transfer) with the shard geometry and the global packed-document
+    boundaries the Ulysses varlen path needs; the pre-hook consumes it and skips
+    broadcasting and re-sharding. ``load_balance`` must be the runtime's
+    ``shard_load_balance`` (``"contiguous"`` or ``"head_tail"``).
+    """
+    if cp_size == 1:
+        return batch
+    if load_balance not in ("contiguous", "none", "head_tail"):
+        raise ValueError(
+            f"unsupported shard layout for collator-side sharding: {load_balance}"
+        )
+    batch = prepare_global_batch(batch)
+    global_pos = batch.get("position_ids")
+    layout = "head_tail" if load_balance == "head_tail" else "contiguous"
+    batch, info = shard_batch(
+        batch, cp_rank=cp_rank, cp_size=cp_size, load_balance=layout
+    )
+    total = info.original_seq_len + info.pad_len
+    varlen = varlen_meta(global_pos, total)
+    batch[CP_SHARD_KEY] = {
+        "cp_rank": cp_rank,
+        "cp_size": cp_size,
+        "load_balance": layout,
+        "original_seq_len": info.original_seq_len,
+        "pad_len": info.pad_len,
+        "varlen": None if varlen is None else (varlen[0].tolist(), varlen[1]),
+    }
+    return batch
+
+
+def varlen_from_shard_info(shard: dict, device) -> tuple | None:
+    """Rebuild the runtime ``varlen`` tuple from a :data:`CP_SHARD_KEY` entry."""
+    varlen = shard.get("varlen")
+    if varlen is None:
+        return None
+    cu, maximum = varlen
+    return torch.tensor(cu, dtype=torch.int32, device=device), int(maximum)
