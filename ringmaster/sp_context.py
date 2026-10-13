@@ -14,7 +14,14 @@ import torch.distributed as dist
 from ringmaster.cp_collectives import seq_gather_cp
 from ringmaster.loss import correct_eval_loss, global_num_items_in_batch
 from ringmaster.runtime import maybe_runtime
-from ringmaster.shard import shard_batch, varlen_meta
+from ringmaster.shard import (
+    _GLOBAL_METADATA_KEYS,
+    CP_SHARD_KEY,
+    prepare_global_batch,
+    shard_batch,
+    varlen_from_shard_info,
+    varlen_meta,
+)
 
 
 from ringmaster.batch import broadcast_batch
@@ -80,73 +87,46 @@ class ContextParallelContextManager:
             if ids is None or self.cp_size == 1:
                 return remaining, kwargs
 
-            broadcast_batch(kwargs, self.cp_group)
-            ids = kwargs["input_ids"]
-            mask = kwargs.get("attention_mask")
-            if mask is not None:
+            pre_sharded = kwargs.pop(CP_SHARD_KEY, None)
+            if pre_sharded is not None:
+                # The collator already cut this rank's shard; nothing to broadcast.
                 if (
-                    mask.ndim != 2
-                    or torch.any(mask < 0)
-                    or (
-                        mask.is_floating_point()
-                        and torch.any(~torch.isfinite(mask) | (mask != mask.round()))
-                    )
-                    or torch.any((mask[:, 1:] > 0) & (mask[:, :-1] == 0))
+                    pre_sharded["cp_size"] != self.cp_size
+                    or pre_sharded["cp_rank"] != self.cp_rank
+                    or pre_sharded["load_balance"] != self.load_balance
                 ):
                     raise ValueError(
-                        "Context parallelism requires a right-padded causal 2D mask"
+                        "Collator-side CP shard does not match this context: "
+                        f"{pre_sharded} vs rank {self.cp_rank}/{self.cp_size} "
+                        f"{self.load_balance}"
                     )
-                if torch.any(mask > 1) and kwargs.get("position_ids") is None:
-                    positions = torch.arange(
-                        mask.shape[1], device=mask.device
-                    ).expand_as(mask)
-                    starts = torch.ones_like(mask, dtype=torch.bool)
-                    starts[:, 1:] = mask[:, 1:] != mask[:, :-1]
-                    offsets = torch.where(starts, positions, 0).cummax(dim=1).values
-                    kwargs["position_ids"] = positions - offsets
-                kwargs.pop("attention_mask")
-            if kwargs.get("position_ids") is None:
-                cu = kwargs.get("cu_seqlens")
-                if cu is None:
-                    cu = kwargs.get("cu_seq_lens_q")
-                if cu is not None:
-                    cu = cu.to(device=ids.device, dtype=torch.long)
-                    if (
-                        cu.ndim != 1
-                        or cu.numel() < 2
-                        or int(cu[0]) != 0
-                        or int(cu[-1]) != ids.numel()
-                        or torch.any(cu[1:] <= cu[:-1])
-                    ):
-                        raise ValueError("Invalid global packed document boundaries")
-                    positions = torch.arange(ids.numel(), device=ids.device)
-                    documents = torch.bucketize(positions, cu[1:], right=True)
-                    kwargs["position_ids"] = (positions - cu[documents]).reshape_as(ids)
-            # Global collator metadata cannot describe a local shard.
-            for key in (
-                "cu_seq_lens_q",
-                "cu_seq_lens_k",
-                "max_length_q",
-                "max_length_k",
-                "cu_seqlens",
-                "max_seqlen",
-            ):
-                kwargs.pop(key, None)
-            global_pos = kwargs.get("position_ids")  # full sequence, before sharding
-            kwargs, info = shard_batch(
-                kwargs,
-                cp_rank=self.cp_rank,
-                cp_size=self.cp_size,
-                load_balance=self.load_balance,
-            )
-            self._orig_seq_len, self._pad_len = info.original_seq_len, info.pad_len
-            # stash packed-sequence cu_seqlens for the Ulysses varlen path (None clears
-            # any stale value from the previous step).
-            rt = maybe_runtime()
-            if rt is not None:
-                rt.varlen = varlen_meta(
-                    global_pos, info.original_seq_len + info.pad_len
+                for key in _GLOBAL_METADATA_KEYS:
+                    kwargs.pop(key, None)
+                self._orig_seq_len = pre_sharded["original_seq_len"]
+                self._pad_len = pre_sharded["pad_len"]
+                rt = maybe_runtime()
+                if rt is not None:
+                    rt.varlen = varlen_from_shard_info(pre_sharded, ids.device)
+            else:
+                broadcast_batch(kwargs, self.cp_group)
+                kwargs = prepare_global_batch(kwargs)
+                global_pos = kwargs.get(
+                    "position_ids"
+                )  # full sequence, before sharding
+                kwargs, info = shard_batch(
+                    kwargs,
+                    cp_rank=self.cp_rank,
+                    cp_size=self.cp_size,
+                    load_balance=self.load_balance,
                 )
+                self._orig_seq_len, self._pad_len = info.original_seq_len, info.pad_len
+                # stash packed-sequence cu_seqlens for the Ulysses varlen path (None clears
+                # any stale value from the previous step).
+                rt = maybe_runtime()
+                if rt is not None:
+                    rt.varlen = varlen_meta(
+                        global_pos, info.original_seq_len + info.pad_len
+                    )
 
             # count valid tokens from shift_labels (what the model's loss uses)
             count_labels = kwargs.get("shift_labels")
