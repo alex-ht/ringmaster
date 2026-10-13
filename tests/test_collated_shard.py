@@ -134,3 +134,30 @@ def test_pre_hook_rejects_mismatched_shard():
     ctx.models[0].eval()
     with pytest.raises(ValueError, match="does not match this context"):
         hook(ctx.models[0], (), dict(sharded))
+
+
+def test_pre_hook_rejects_shard_in_single_rank_context():
+    ctx = _context(0, 1, "contiguous")
+    sharded = shard_collated_batch(_packed_batch(), cp_rank=0, cp_size=2)
+    hook = ctx._make_pre_hook(["input_ids", "labels", "position_ids"])
+    ctx.models[0].eval()
+    with pytest.raises(ValueError, match="does not match this context"):
+        hook(ctx.models[0], (), dict(sharded))
+
+
+def test_pre_hook_accepts_none_layout_alias(monkeypatch):
+    ctx = _context(1, 2, "none")
+    sharded = shard_collated_batch(
+        _packed_batch(), cp_rank=1, cp_size=2, load_balance="none"
+    )
+    import ringmaster.sp_context as sp
+
+    monkeypatch.setattr(sp, "shard_batch", lambda *a, **k: pytest.fail("re-sharded"))
+    monkeypatch.setattr(sp, "maybe_runtime", lambda: None)
+    hook = ctx._make_pre_hook(["input_ids", "labels", "position_ids"])
+    ctx.models[0].eval()
+
+    _, kwargs = hook(ctx.models[0], (), dict(sharded))
+
+    assert CP_SHARD_KEY not in kwargs
+    assert torch.equal(kwargs["input_ids"], sharded["input_ids"])

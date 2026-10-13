@@ -75,6 +75,23 @@ class ContextParallelContextManager:
             self._handles.append(model.register_forward_hook(self._post_hook))
         return self._handles
 
+    @property
+    def shard_layout(self) -> str:
+        """Layout ``shard_batch`` applies for ``load_balance`` (``none`` is contiguous)."""
+        return "head_tail" if self.load_balance == "head_tail" else "contiguous"
+
+    def _check_shard(self, pre_sharded):
+        if (
+            pre_sharded["cp_size"] != self.cp_size
+            or pre_sharded["cp_rank"] != self.cp_rank
+            or pre_sharded["load_balance"] != self.shard_layout
+        ):
+            raise ValueError(
+                "Collator-side CP shard does not match this context: "
+                f"{pre_sharded} vs rank {self.cp_rank}/{self.cp_size} "
+                f"{self.shard_layout}"
+            )
+
     def _make_pre_hook(self, forward_params):
         def pre_hook(module, args, kwargs):
             kwargs = dict(kwargs)
@@ -83,23 +100,17 @@ class ContextParallelContextManager:
                     kwargs[forward_params[i]] = arg
             remaining = args[len(forward_params) :]
 
+            # Pop the marker first so it never reaches forward; a batch that was cut
+            # for a different geometry is rejected even on the single-rank path.
+            pre_sharded = kwargs.pop(CP_SHARD_KEY, None)
+            if pre_sharded is not None:
+                self._check_shard(pre_sharded)
             ids = kwargs.get("input_ids")
             if ids is None or self.cp_size == 1:
                 return remaining, kwargs
 
-            pre_sharded = kwargs.pop(CP_SHARD_KEY, None)
             if pre_sharded is not None:
                 # The collator already cut this rank's shard; nothing to broadcast.
-                if (
-                    pre_sharded["cp_size"] != self.cp_size
-                    or pre_sharded["cp_rank"] != self.cp_rank
-                    or pre_sharded["load_balance"] != self.load_balance
-                ):
-                    raise ValueError(
-                        "Collator-side CP shard does not match this context: "
-                        f"{pre_sharded} vs rank {self.cp_rank}/{self.cp_size} "
-                        f"{self.load_balance}"
-                    )
                 for key in _GLOBAL_METADATA_KEYS:
                     kwargs.pop(key, None)
                 self._orig_seq_len = pre_sharded["original_seq_len"]
