@@ -11,6 +11,7 @@ causal uses contiguous sharding.
 
 from __future__ import annotations
 
+import logging
 import math
 from functools import lru_cache
 
@@ -19,20 +20,46 @@ import torch.distributed as dist
 
 from ringmaster.ring.merge import update_out_and_lse
 
+LOG = logging.getLogger(__name__)
 
-@lru_cache(maxsize=2)
+
 def _flash_ops(attn_implementation: str = "flash_attention_2"):
     """Return (fwd, bwd) low-level Dao flash ops, or None if unavailable."""
     try:
-        from transformers.modeling_flash_attention_utils import _lazy_imports
-
-        fn = _lazy_imports(attn_implementation)[0]
-        if fn is None:
-            return None
-        mod = __import__(fn.__module__, fromlist=["x"])
-        return mod._flash_attn_forward, mod._flash_attn_backward
+        from transformers import modeling_flash_attention_utils as fau
     except Exception:
         return None
+    return _resolve_flash_ops(
+        attn_implementation, getattr(fau, "_loaded_implementation", None)
+    )
+
+
+@lru_cache(maxsize=4)
+def _resolve_flash_ops(attn_implementation, loaded_implementation):
+    from transformers import modeling_flash_attention_utils as fau
+
+    # Reuse the kernel transformers already loaded for the model. Re-resolving a hub-kernel
+    # fallback (e.g. kernels-community/flash-attn2) goes back to the Hub, so a transient error
+    # or offline mode there would cache None and disable flash for the whole process.
+    fallback = getattr(fau, "FLASH_ATTN_KERNEL_FALLBACK", {}).get(attn_implementation)
+    if loaded_implementation in (attn_implementation, fallback):
+        ops = _dao_ops(getattr(fau, "_flash_fn", None))
+        if ops is not None:
+            return ops
+    try:
+        return _dao_ops(fau._lazy_imports(attn_implementation)[0])
+    except Exception as exc:
+        LOG.warning("flash attention ops for %s unavailable: %s", attn_implementation, exc)
+        return None
+
+
+def _dao_ops(fn):
+    if fn is None:
+        return None
+    mod = __import__(fn.__module__, fromlist=["x"])
+    fwd = getattr(mod, "_flash_attn_forward", None)
+    bwd = getattr(mod, "_flash_attn_backward", None)
+    return (fwd, bwd) if fwd is not None and bwd is not None else None
 
 
 def _peers(group):
