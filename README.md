@@ -15,6 +15,10 @@ takes two routes that avoid that dependency entirely:
 - **Ulysses** wraps the model's *own* attention kernel with all-to-all on the head
   dim — works with any kernel (FA2/3/4/sdpa/flex), inherently load-balanced, the
   cheapest comm. Capped by KV-head count.
+  With `flex_attention` the wrapper builds one `BlockMask` per step over the
+  gathered global sequence (causal, same-document for packed batches, plus each
+  layer's sliding window), shared by every layer with the same geometry, instead of
+  a dense S×S mask.
 - **Ring** rides torch-native context parallel (`torch.distributed.tensor.experimental`)
   on the SDPA/FlexAttention backends — no head cap, scales linearly. LSE merging
   is handled inside aten, so we never reimplement a ring kernel.

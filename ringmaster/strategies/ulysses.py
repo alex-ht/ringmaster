@@ -15,10 +15,15 @@ import torch
 
 from ringmaster.comm import seq_all_to_all
 from ringmaster.runtime import get_runtime
-from ringmaster.shard import attention_segments
+from ringmaster.shard import attention_chunk_size, attention_segments
 from ringmaster.strategies.query_scaling import global_query_scale
 
 REGISTERED_NAME = "ringmaster_ulysses"
+
+# Feature flag for integrators: the flex_attention inner builds a causal /
+# same-document / sliding-window BlockMask over the gathered sequence (exact for
+# packed and Gemma-style hybrid sliding/global models, forward and backward).
+SUPPORTS_FLEX_BLOCK_MASK = True
 
 
 def _resolve_inner(inner_name: str):
@@ -55,7 +60,7 @@ def _ulysses_varlen(
     cu, max_len = varlen
     cu = cu.to(q.device)
 
-    if inner_name in ("sdpa", "flex_attention"):
+    if inner_name == "sdpa":
         lengths = cu.diff().long()
         doc = torch.repeat_interleave(
             torch.arange(len(lengths), device=q.device), lengths
@@ -95,6 +100,93 @@ def _ulysses_varlen(
     if isinstance(out, tuple):
         out = out[0]
     return out.reshape(q.shape[0], q.shape[2], q.shape[1], q.shape[3])
+
+
+# --------------------------------------------------------------------------------------
+# flex_attention inner: after the all-to-all each rank holds the FULL sequence for a head
+# subset, so one BlockMask over the global positions (causal, plus same-document for
+# packed/chunked batches, plus the layer's sliding window) is exact. The model's own
+# mask creation is skipped under the registered Ulysses name (attention_mask is None),
+# so without this the flex inner would run unmasked (bidirectional).
+# --------------------------------------------------------------------------------------
+
+_FLEX_MASK_CACHE: dict = {"src": None, "masks": {}}
+
+
+def _clear_flex_mask_cache() -> None:
+    _FLEX_MASK_CACHE["src"] = None
+    _FLEX_MASK_CACHE["masks"] = {}
+
+
+def _document_ids(module, packed, batch_size, seq_len, device):
+    """[B, S] document id per global position, or None when every row is one document
+    (no packing, no chunked attention) so the mask can broadcast over the batch."""
+    if packed is None and attention_chunk_size(module) is None:
+        return None
+    cu, _ = attention_segments(module, packed, batch_size, seq_len, device)
+    lengths = cu.to(device).diff().long()
+    return torch.repeat_interleave(
+        torch.arange(len(lengths), device=device), lengths
+    ).reshape(batch_size, seq_len)
+
+
+def _build_flex_block_mask(doc, batch_size, seq_len, device, causal, sliding_window):
+    from torch.nn.attention.flex_attention import create_block_mask
+
+    def mask_mod(b, h, q_idx, kv_idx):
+        allowed = q_idx >= kv_idx if causal else kv_idx >= 0
+        if sliding_window:
+            allowed = allowed & (q_idx - kv_idx < sliding_window)
+        if doc is not None:
+            allowed = allowed & (doc[b, q_idx] == doc[b, kv_idx])
+        return allowed
+
+    return create_block_mask(
+        mask_mod,
+        batch_size if doc is not None else None,
+        None,
+        seq_len,
+        seq_len,
+        device=device,
+    )
+
+
+def ulysses_flex_block_mask(
+    module, packed, batch_size, seq_len, device, *, causal=True, sliding_window=None
+):
+    """BlockMask for the head-sharded full sequence, cached so every layer of a step with
+    the same (S, window, causal, segments) reuses one mask. The cache is dropped whenever
+    the step's packed metadata object (``runtime.varlen``) changes."""
+    if _FLEX_MASK_CACHE["src"] is not packed:
+        _FLEX_MASK_CACHE["src"] = packed
+        _FLEX_MASK_CACHE["masks"] = {}
+    chunk = attention_chunk_size(module)
+    has_doc = packed is not None or chunk is not None
+    key = (
+        batch_size if has_doc else None,
+        seq_len,
+        str(device),
+        bool(causal),
+        int(sliding_window) if sliding_window else None,
+        chunk,
+    )
+    mask = _FLEX_MASK_CACHE["masks"].get(key)
+    if mask is None:
+        doc = _document_ids(module, packed, batch_size, seq_len, device)
+        mask = _build_flex_block_mask(
+            doc, batch_size, seq_len, device, bool(causal), sliding_window
+        )
+        _FLEX_MASK_CACHE["masks"][key] = mask
+    return mask
+
+
+def _local_heads(t, world, rank, n_heads):
+    """Slice a per-head tensor (e.g. attention sinks ``s_aux``) to this rank's head
+    chunk; the all-to-all scatters heads contiguously in rank order."""
+    if t is None or t.dim() == 0 or t.shape[0] != n_heads:
+        return t
+    per = n_heads // world
+    return t[rank * per : (rank + 1) * per]
 
 
 def make_ulysses_attention(inner_name: str):
@@ -168,14 +260,61 @@ def make_ulysses_attention(inner_name: str):
             )
             k, v = kv[0], kv[1]
 
+        sliding_window = kwargs.get("sliding_window") or getattr(
+            module, "sliding_window", None
+        )
+        if inner_name == "flex_attention":
+            # One BlockMask over the gathered global sequence (causal + same-document +
+            # sliding window), routed through the registered flex kernel so wrappers
+            # (e.g. forced kernel_options) and HF's GQA/softcap/scale handling apply.
+            block_mask = ulysses_flex_block_mask(
+                module,
+                rt.varlen,
+                q.shape[0],
+                q.shape[2],
+                q.device,
+                causal=is_causal is not False,
+                sliding_window=sliding_window,
+            )
+            flex_kwargs = dict(kwargs)
+            flex_kwargs.pop("sliding_window", None)
+            if flex_kwargs.get("s_aux") is not None:
+                flex_kwargs["s_aux"] = _local_heads(
+                    flex_kwargs["s_aux"], world, dist.get_rank(group), query.shape[1]
+                )
+            cfg = getattr(module, "config", None)
+            saved = (
+                getattr(cfg, "_attn_implementation", None) if cfg is not None else None
+            )
+            if cfg is not None:
+                cfg._attn_implementation = inner_name
+            try:
+                attn_out, _ = inner(
+                    module,
+                    q,
+                    k,
+                    v,
+                    block_mask,
+                    dropout=dropout,
+                    scaling=scaling,
+                    is_causal=is_causal,
+                    **flex_kwargs,
+                )
+            finally:
+                if cfg is not None:
+                    cfg._attn_implementation = saved
+            attn_out = seq_all_to_all(
+                attn_out.contiguous(), scatter_dim=1, gather_dim=2, group=group
+            )
+            return attn_out, None
+
         segments = attention_segments(
             module,
             rt.varlen,
             q.shape[0],
             q.shape[2],
             q.device,
-            sliding_window=kwargs.get("sliding_window")
-            or getattr(module, "sliding_window", None),
+            sliding_window=sliding_window,
         )
         if segments is not None:
             # packed sequences: flash varlen over the gathered full pack (global cu_seqlens)
@@ -188,7 +327,7 @@ def make_ulysses_attention(inner_name: str):
                 scaling,
                 is_causal,
                 inner_name,
-                kwargs.get("sliding_window") or getattr(module, "sliding_window", None),
+                sliding_window,
             )
         else:
             # The flash integration reads module.config._attn_implementation to pick the
